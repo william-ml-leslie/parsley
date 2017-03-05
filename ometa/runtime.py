@@ -4,6 +4,7 @@ Code needed to run a grammar after it has been compiled.
 """
 import time
 from textwrap import dedent
+from contextlib import contextmanager
 from terml.nodes import coerceToTerm, Term, termMaker as t
 from ometa.builder import moduleFromGrammar, writePython
 
@@ -184,7 +185,40 @@ class unicodeCharacter(unicode):
 
 
 
-class InputStream(object):
+class _HasMemoTable(object):
+    def __init__(self):
+        self.memo = {}
+        self.lr_head = None
+
+    def getMemo(self, name):
+        """
+        Returns the memo record for the named rule.
+        @param name: A rule name.
+        """
+        return self.memo.get(name, None)
+
+    def setMemo(self, name, rec):
+        """
+        Store a memo record for the given value and position for the given
+        rule.
+        @param name: A rule name.
+        @param rec: A memo record.
+        """
+        self.memo[name] = rec
+        return rec
+
+    @contextmanager
+    def left_recursion(self, glob, ruleName):
+        lr = LeftRecursion(self.nullError(), ruleName)
+        self.setMemo(ruleName, lr)
+        glob.lr_stack.append(lr)
+        try:
+            yield lr
+        finally:
+            glob.lr_stack.pop()
+
+
+class InputStream(_HasMemoTable):
     """
     The basic input mechanism used by OMeta grammars.
     """
@@ -224,9 +258,9 @@ class InputStream(object):
     def __init__(self, data, position):
         self.data = data
         self.position = position
-        self.memo = {}
         self.tl = None
         self.error = ParseError(self.data, self.position, None)
+        super(InputStream, self).__init__()
 
     def head(self):
         if self.position >= len(self.data):
@@ -259,24 +293,6 @@ class InputStream(object):
     def prev(self):
         return InputStream(self.data, self.position-1)
 
-    def getMemo(self, name):
-        """
-        Returns the memo record for the named rule.
-        @param name: A rule name.
-        """
-        return self.memo.get(name, None)
-
-
-    def setMemo(self, name, rec):
-        """
-        Store a memo record for the given value and position for the given
-        rule.
-        @param name: A rule name.
-        @param rec: A memo record.
-        """
-        self.memo[name] = rec
-        return rec
-
     def __cmp__(self, other):
         return cmp((self.data, self.position), (other.data, other.position))
 
@@ -305,12 +321,13 @@ class WrappedValueInputStream(InputStream):
         tail = self.advanceBy(n)
         return [self.wrapper(x) for x in data], self.nullError(), tail
 
-class ArgInput(object):
+class ArgInput(_HasMemoTable):
     def __init__(self, arg, parent):
         self.arg = arg
         self.parent = parent
         self.memo = {}
         self.err = parent.nullError()
+        super(ArgInput, self).__init__()
 
     @property
     def position(self):
@@ -337,30 +354,33 @@ class ArgInput(object):
         return self.parent.nullError()
 
 
-    def getMemo(self, name):
-        """
-        Returns the memo record for the named rule.
-        @param name: A rule name.
-        """
-        return self.memo.get(name, None)
-
-
-    def setMemo(self, name, rec):
-        """
-        Store a memo record for the given value and position for the given
-        rule.
-        @param name: A rule name.
-        @param rec: A memo record.
-        """
-        self.memo[name] = rec
-        return rec
-
-
 class LeftRecursion(object):
     """
     Marker for left recursion in a grammar rule.
     """
-    detected = False
+    def __init__(self, seed, rule):
+        self.seed = seed
+        self.rule = rule
+        self.head = None
+
+    def __repr__(self):
+        return "LeftRecursion(%r, %s, %r)" % (
+            self.seed, self.rule, self.head)
+
+
+class Head(object):
+    def __init__(self, rule):
+        self.rule = rule
+        # rules involved in (mutual) left recursion
+        self.involvedSet = set()
+        # involved rules (as above) that may still be evaluated in
+        # this growth cycle
+        self.evalSet = set()
+
+    def __repr__(self):
+        return "Head(%s, {%s}, {%s})" % (
+            self.rule, ', '.join(sorted(self.involvedSet)),
+            ', '.join(sorted(self.evalSet)))
 
 
 class OMetaBase(object):
@@ -401,6 +421,7 @@ class OMetaBase(object):
             self.globals['basestring'] = str
             self.globals['unichr'] = chr
         self.currentError = self.input.nullError()
+        self.lr_stack = []
 
     def considerError(self, error, typ=None):
         if error:
@@ -466,6 +487,50 @@ class OMetaBase(object):
             raise NameError("No rule named '%s'" %(ruleName,))
 
 
+    def _applyIgnoreMemo(self, rule, ruleName):
+        try:
+            return self.input.setMemo(ruleName, [rule(), self.input])
+        except ParseError as e:
+            e.trail.append(ruleName)
+            raise
+
+
+    def _lrAnswer(self, ruleName, rule, position, mAns, mPos):
+        # LRAnswer(R : Rule, P : Position, M : MemoEntry)
+        head = mAns.head # mAns is a LeftRecursion at this point
+        seed = mAns.seed
+        if head.rule != ruleName:
+            # the head rule is growing the head.  defer to it.
+            if isinstance(seed, ParseError):
+                raise seed
+            return seed, mPos
+        self.input.setMemo(ruleName, [seed, position])
+        if isinstance(seed, ParseError):
+            # we failed without hitting recursion.
+            raise seed
+        sentinel = self.input
+
+        # GrowLR(ruleName, oldPosition, memoRec, head)
+        self.input.lr_head = head # "Line A", in the OMeta paper
+        while True:
+            try:
+                self.input = position
+                head.evalSet = set(head.involvedSet) # Line B
+                ans = rule()
+                if (self.input == sentinel):
+                    break
+
+                mAns, mPos = position.setMemo(ruleName, [ans, self.input])
+            except ParseError:
+                break
+        self.input.lr_head = None # Line C
+        if isinstance(mAns, LeftRecursion):
+            return mAns
+        return [mAns, mPos]
+        # /GrowLR
+        # /LRAnswer
+
+
     def _apply(self, rule, ruleName, args):
         """
         Apply a rule method to some args.
@@ -485,35 +550,41 @@ class OMetaBase(object):
                 return rule()
             else:
                 return rule(*args)
+        head = self.input.lr_head
         memoRec = self.input.getMemo(ruleName)
+        if head is not None:
+            if ruleName != head.rule and ruleName not in head.involvedSet:
+                # This rule does not participate in this growth round
+                raise self.input.nullError()
+            elif ruleName in head.evalSet:
+                # The head requests we try this rule
+                head.evalSet.remove(ruleName)
+                oldPosition = self.input
+                memoRec = self._applyIgnoreMemo(rule, ruleName)
+                self.input = oldPosition
+
         if memoRec is None:
             oldPosition = self.input
-            lr = LeftRecursion()
-            memoRec = self.input.setMemo(ruleName, lr)
-            try:
-                memoRec = self.input.setMemo(ruleName,
-                                         [rule(), self.input])
-            except ParseError as e:
-                e.trail.append(ruleName)
-                raise
-            if lr.detected:
-                sentinel = self.input
-                while True:
-                    try:
-                        self.input = oldPosition
-                        ans = rule()
-                        if (self.input == sentinel):
-                            break
-
-                        memoRec = oldPosition.setMemo(ruleName,
-                                                     [ans, self.input])
-                    except ParseError:
-                        break
-            self.input = oldPosition
-
-        elif isinstance(memoRec, LeftRecursion):
-            memoRec.detected = True
-            raise self.input.nullError()
+            with self.input.left_recursion(self, ruleName) as lr:
+                memoRec = self._applyIgnoreMemo(rule, ruleName)
+            if lr.head is not None:
+                lr.seed = memoRec[0]
+                # memoRec? lr?
+                memoRec = self._lrAnswer(ruleName, rule, self.input, lr,
+                                         memoRec[1])
+        if isinstance(memoRec, LeftRecursion):
+            # SetupLR
+            if memoRec.head is None:
+                memoRec.head = Head(ruleName)
+            for lr in reversed(self.lr_stack):
+                if lr.head == memoRec.head:
+                    break
+                lr.head = memoRec.head
+                memoRec.head.involvedSet.add(lr.rule)
+            # /SetupLR
+            if isinstance(memoRec.seed, ParseError):
+                raise memoRec.seed
+            return memoRec.seed
         self.input = memoRec[1]
         return memoRec[0]
 
@@ -553,6 +624,7 @@ class OMetaBase(object):
                 m = self.input
                 v, _ = fn()
                 ans.append(v)
+                assert self.input.position > m.position
             except ParseError as err:
                 e = err
                 self.input = m
