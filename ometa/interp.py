@@ -1,6 +1,6 @@
 import string
 from ometa.runtime import (InputStream, ParseError, EOFError, ArgInput,
-                           joinErrors, expected, LeftRecursion)
+                           LeftRecursion, Head, joinErrors, expected)
 
 def decomposeGrammar(grammar):
     rules = {}
@@ -32,6 +32,7 @@ class TrampolinedGrammarInterpreter(object):
         self.input = InputStream([], 0)
         self.ended = False
         self._spanStart = 0
+        self.lr_stack = []
 
 
     def receive(self, buf):
@@ -74,6 +75,56 @@ class TrampolinedGrammarInterpreter(object):
         return self.apply(rule[0], None, rule[1:])
 
 
+    def _lrAnswer(self, ruleName, rule, position, mAns):
+        # LRAnswer(R : Rule, P : Position, M : MemoEntry)
+        head = mAns.head # mAns is a LeftRecursion at this point
+        seed = mAns.seed
+        if head.rule != ruleName:
+            # the head rule is growing the head.  defer to it.
+            if isinstance(seed, ParseError):
+                raise seed
+            yield seed
+            return
+        self.input.setMemo(ruleName, seed)
+        if isinstance(seed, ParseError):
+            # we failed without hitting recursion.
+            raise seed
+        sentinel = self.input
+
+        result = mAns
+
+        # GrowLR(ruleName, oldPosition, memoRec, head)
+        position.lr_head = head # "Line A", in the OMeta paper
+        while True:
+            try:
+                self.input = position
+                head.evalSet = set(head.involvedSet) # Line B
+                for ans in rule():
+                    if ans is _feed_me:
+                        yield ans
+                if (self.input == sentinel):
+                    break
+
+                result = position.setMemo(ruleName, [ans, self.input])
+            except ParseError:
+                break
+        position.lr_head = None # Line C
+        yield result
+        # /GrowLR
+        # /LRAnswer
+
+
+    def _applyIgnoreMemo(self, rule, ruleName):
+        try:
+            for ans in self.input.setMemo(ruleName, [rule(), self.input]):
+                yield ans
+                if ans is not _feed_me:
+                    return
+        except ParseError as e:
+            e.trail.append(ruleName)
+            raise
+
+
     ## Implementation note: each method, instead of being a function
     ## returning a value, is a generator that will yield '_feed_me' an
     ## arbitrary number of times, then finally yield the value of the
@@ -99,39 +150,49 @@ class TrampolinedGrammarInterpreter(object):
                 if x is _feed_me: yield x
             yield x
             return
+        head = self.input.lr_head
         memoRec = self.input.getMemo(ruleName)
+        if head is not None:
+            if ruleName != head.rule and ruleName not in head.involvedSet:
+                # This rule does not participate in this growth round
+                raise self.input.nullError()
+            elif ruleName in head.evalSet:
+                # The head requests we try this rule
+                head.evalSet.remove(ruleName)
+                oldPosition = self.input
+                for ans in self._applyIgnoreMemo(rule, ruleName):
+                    if ans is _feed_me:
+                        yield ans
+                memoRec = ans
+                self.input = oldPosition
+
         if memoRec is None:
             oldPosition = self.input
-            lr = LeftRecursion()
-            memoRec = self.input.setMemo(ruleName, lr)
-
-            try:
+            with self.input.left_recursion(self, ruleName) as lr:
                 inp = self.input
                 for x in rule():
                     if x is _feed_me: yield x
                 memoRec = inp.setMemo(ruleName, [x, self.input])
-            except ParseError:
-                raise
-            if lr.detected:
-                sentinel = self.input
-                while True:
-                    try:
-                        self.input = oldPosition
-                        for x in rule():
-                            if x is _feed_me: yield x
-                        ans = x
-                        if (self.input == sentinel):
-                            break
+            if lr.head is not None:
+                lr.seed = memoRec
+                # memoRec? lr?
+                for x in self._lrAnswer(ruleName, rule, oldPosition, lr):
+                    if x is _feed_me: yield x
+                memoRec = x
 
-                        memoRec = oldPosition.setMemo(ruleName,
-                                                     [ans, self.input])
-                    except ParseError:
-                        break
-            self.input = oldPosition
-
-        elif isinstance(memoRec, LeftRecursion):
-            memoRec.detected = True
-            raise self.input.nullError()
+        if isinstance(memoRec, LeftRecursion):
+            # SetupLR
+            if memoRec.head is None:
+                memoRec.head = Head(ruleName)
+            for lr in reversed(self.lr_stack):
+                if lr.head == memoRec.head:
+                    break
+                lr.head = memoRec.head
+                memoRec.head.involvedSet.add(lr.rule)
+            # /SetupLR
+            if isinstance(memoRec.seed, ParseError):
+                raise memoRec.seed
+            memoRec = memoRec.seed
         self.input = memoRec[1]
         yield memoRec[0]
 
