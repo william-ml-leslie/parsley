@@ -495,7 +495,7 @@ class OMetaBase(object):
             raise
 
 
-    def _lrAnswer(self, ruleName, rule, position, mAns, mPos):
+    def _lrAnswer(self, ruleName, rule, position, mAns):
         # LRAnswer(R : Rule, P : Position, M : MemoEntry)
         head = mAns.head # mAns is a LeftRecursion at this point
         seed = mAns.seed
@@ -503,15 +503,17 @@ class OMetaBase(object):
             # the head rule is growing the head.  defer to it.
             if isinstance(seed, ParseError):
                 raise seed
-            return seed, mPos
-        self.input.setMemo(ruleName, [seed, position])
+            return seed
+        self.input.setMemo(ruleName, seed)
         if isinstance(seed, ParseError):
             # we failed without hitting recursion.
             raise seed
         sentinel = self.input
 
+        result = mAns
+
         # GrowLR(ruleName, oldPosition, memoRec, head)
-        self.input.lr_head = head # "Line A", in the OMeta paper
+        position.lr_head = head # "Line A", in the OMeta paper
         while True:
             try:
                 self.input = position
@@ -520,13 +522,11 @@ class OMetaBase(object):
                 if (self.input == sentinel):
                     break
 
-                mAns, mPos = position.setMemo(ruleName, [ans, self.input])
+                result = position.setMemo(ruleName, [ans, self.input])
             except ParseError:
                 break
-        self.input.lr_head = None # Line C
-        if isinstance(mAns, LeftRecursion):
-            return mAns
-        return [mAns, mPos]
+        position.lr_head = None # Line C
+        return result
         # /GrowLR
         # /LRAnswer
 
@@ -568,10 +568,9 @@ class OMetaBase(object):
             with self.input.left_recursion(self, ruleName) as lr:
                 memoRec = self._applyIgnoreMemo(rule, ruleName)
             if lr.head is not None:
-                lr.seed = memoRec[0]
+                lr.seed = memoRec
                 # memoRec? lr?
-                memoRec = self._lrAnswer(ruleName, rule, self.input, lr,
-                                         memoRec[1])
+                memoRec = self._lrAnswer(ruleName, rule, oldPosition, lr)
         if isinstance(memoRec, LeftRecursion):
             # SetupLR
             if memoRec.head is None:
@@ -584,7 +583,7 @@ class OMetaBase(object):
             # /SetupLR
             if isinstance(memoRec.seed, ParseError):
                 raise memoRec.seed
-            return memoRec.seed
+            memoRec = memoRec.seed
         self.input = memoRec[1]
         return memoRec[0]
 
